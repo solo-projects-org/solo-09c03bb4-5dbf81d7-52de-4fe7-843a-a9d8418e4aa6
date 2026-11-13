@@ -582,3 +582,269 @@ def test_resolution_sync_before_conflict_ops(stations):
             assert rec["conflicted"] is False and rec["count"] == 50
     finally:
         shutil.rmtree(fresh_dir, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- 缺件同步
+
+
+def _ops_by_id(client, **params):
+    return {o["id"]: o for o in client.get("/sync/pull", params=params).json()["ops"]}
+
+
+def test_missing_first_op_holds_clock_and_reports_gap(stations):
+    """先到第 2 条、第 1 条缺件：时钟不得虚高，缺口持久化，旧数据仍可分析。"""
+    a, b = stations["alpha"], stations["bravo"]
+    b.post("/records/R001/corrections", json={"count": 70})   # bravo-1
+    b.post("/records/R002/corrections", json={"count": 80})   # bravo-2
+    ops = _ops_by_id(b)
+
+    r = a.post("/sync/batch", json={"ops": [ops["bravo-2"]]})
+    assert r.status_code == 200
+    st = a.get("/status").json()
+    # 缺件未补齐：向量时钟不能被消息携带的时钟带到 bravo:2
+    assert st["version_vv"] == {}
+    assert st["inbound_watermarks"].get("bravo", {}).get("op", 0) == 0
+    assert st["inbound_gaps"] == {"bravo": {"op": [2]}}
+    # 已到的第 2 条仍参与本地对账（R002 显示新值且无冲突），但 R001 保持种子旧值
+    assert a.get("/records/R002").json()["count"] == 80
+    assert a.get("/records/R001").json()["count"] == 32
+    # 旧计数 R001 未被删除/冲突，分析仍可取；R002 也仍可取（尚未出现并发分支）
+    ids = {x["record_id"] for x in a.get("/analysis/counts").json()}
+    assert {"R001", "R002"} <= ids
+
+
+def test_gap_fill_via_sync_run_makes_conflict_and_excludes_analysis(stations):
+    """缺件期间允许本地更正；补齐后不同计数按原规则列冲突并从分析排除。"""
+    a, b = stations["alpha"], stations["bravo"]
+    b.post("/records/R001/corrections", json={"count": 70})   # bravo-1（缺件）
+    b.post("/records/R002/corrections", json={"count": 80})   # bravo-2（先到）
+    ops = _ops_by_id(b)
+    a.post("/sync/batch", json={"ops": [ops["bravo-2"]]})
+
+    # 缺件窗口内 alpha 对同一记录 R002 做本地更正
+    r = a.post("/records/R002/corrections", json={"count": 11})
+    assert r.status_code == 201
+
+    # 一键同步自动补齐缺的 bravo-1，并交换 alpha 的本地更正
+    r = a.post("/sync/run")
+    assert r.status_code == 200, r.text
+    st = a.get("/status").json()
+    assert st["inbound_gaps"] == {}
+    assert st["version_vv"] == {"alpha": 1, "bravo": 2}
+
+    # R002：alpha 的 11 与 bravo 的 80 并发 -> 冲突，分析排除，且不被任一方覆盖
+    rec = a.get("/records/R002").json()
+    assert rec["conflicted"] is True
+    assert {br["count"] for br in a.get("/conflicts").json()[0]["branches"]} == {11, 80}
+    assert "R002" not in {x["record_id"] for x in a.get("/analysis/counts").json()}
+    # R001：缺件补齐后正常收敛为 70，无冲突
+    r1 = a.get("/records/R001").json()
+    assert r1["count"] == 70 and r1["conflicted"] is False
+
+    # 两站收齐相同日志后记录与冲突完全一致
+    b.post("/sync/run")
+    assert a.get("/records").json() == b.get("/records").json()
+    assert a.get("/conflicts").json() == b.get("/conflicts").json()
+
+
+def test_missing_delete_delivered_later_is_conflict_not_overwritten(stations):
+    """缺件是一条删除：补齐后与缺件期间的本地更正冲突，不会被静默覆盖。"""
+    a, b = stations["alpha"], stations["bravo"]
+    b.delete("/records/R003")                                   # bravo-1 删除（缺件）
+    b.post("/records/R004/corrections", json={"count": 44})    # bravo-2（先到）
+    ops = _ops_by_id(b)
+    a.post("/sync/batch", json={"ops": [ops["bravo-2"]]})
+
+    # 缺件期间 alpha 在将被删除的 R003 上本地更正
+    a.post("/records/R003/corrections", json={"count": 33})
+    a.post("/sync/run")
+
+    rec = a.get("/records/R003").json()
+    assert rec["conflicted"] is True
+    conflict = next(c for c in a.get("/conflicts").json() if c["record_id"] == "R003")
+    assert {br["type"] for br in conflict["branches"]} == {"count", "delete"}
+    assert "R003" not in {x["record_id"] for x in a.get("/analysis/counts").json()}
+
+
+def test_gap_survives_restart_and_fills_after_boot(stations):
+    """重启后缺口与水位仍在，继续同步可补齐缺件（含删除），两站收敛。"""
+    a = stations["alpha"]
+    b_app = stations["bravo_app"]
+    b = stations["bravo"]
+    b.delete("/records/R003")                                   # bravo-1
+    b.post("/records/R004/corrections", json={"count": 44})    # bravo-2
+    ops = _ops_by_id(b)
+    a.post("/sync/batch", json={"ops": [ops["bravo-2"]]})
+    assert a.get("/status").json()["inbound_gaps"] == {"bravo": {"op": [2]}}
+
+    # 用同一数据卷重启 alpha
+    restarted = create_app(
+        "alpha", stations["alpha_db"], CSV_PATH, peer_url="http://bravo.local"
+    )
+    with TestClient(restarted) as rc:
+        restarted.state.peer_transport = httpx.ASGITransport(app=b_app)
+        st = rc.get("/status").json()
+        # 缺口持久化、时钟仍未虚高
+        assert st["inbound_gaps"] == {"bravo": {"op": [2]}}
+        assert st["version_vv"] == {}
+
+        r = rc.post("/sync/run")
+        assert r.status_code == 200, r.text
+        assert rc.get("/status").json()["inbound_gaps"] == {}
+        assert rc.get("/records/R003").json()["deleted"] is True
+        assert rc.get("/records/R004").json()["count"] == 44
+
+        # 补齐后再次同步：已收的更正/删除不重复传输
+        again = rc.post("/sync/run").json()
+        assert again["pulled_ops"] == 0 and again["pushed_ops"] == 0
+
+
+def test_failed_batch_leaves_no_progress_and_no_data(stations):
+    """批次失败整批回滚：不写入任何操作，也不推进收件水位/缺口。"""
+    a = stations["alpha"]
+    before = a.get("/status").json()
+    good = {
+        "id": "bravo-7", "record_id": "R001", "station_id": "bravo",
+        "seq": 7, "type": "count", "count": 5,
+        "vv": {"bravo": 7}, "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    bad = dict(good, id="bravo-9", seq=9, vv={"bravo": 1})  # 分量与 seq 不符
+    r = a.post("/sync/batch", json={"ops": [good, bad]})
+    assert r.status_code == 400
+    after = a.get("/status").json()
+    assert after["op_count"] == before["op_count"]
+    assert after["inbound_watermarks"] == before["inbound_watermarks"]
+    assert after["inbound_gaps"] == before["inbound_gaps"]
+    assert after["version_vv"] == before["version_vv"]
+
+
+def test_duplicate_and_out_of_order_delivery_never_duplicates(stations):
+    """乱序 + 重复投递：缺口表与全局 ID 双重幂等，不重复入库，补齐后只算一次。"""
+    a, b = stations["alpha"], stations["bravo"]
+    b.post("/records/R001/corrections", json={"count": 70})  # bravo-1
+    b.post("/records/R002/corrections", json={"count": 80})  # bravo-2
+    b.post("/records/R003/corrections", json={"count": 90})  # bravo-3
+    ops = _ops_by_id(b)
+
+    # 先乱序投 3、再投 3（重复）、再投 2，最后投 1 补齐
+    assert a.post("/sync/batch", json={"ops": [ops["bravo-3"]]}).status_code == 200
+    dup = a.post("/sync/batch", json={"ops": [ops["bravo-3"]]}).json()
+    assert dup["applied_ops"] == 0 and dup["duplicate_ops"] == 1
+    a.post("/sync/batch", json={"ops": [ops["bravo-2"]]})
+    st = a.get("/status").json()
+    assert st["inbound_gaps"] == {"bravo": {"op": [2, 3]}}
+    assert st["version_vv"] == {}  # 两件都在缺件窗口，时钟不动
+
+    fill = a.post("/sync/batch", json={"ops": [ops["bravo-1"]]}).json()
+    assert fill["applied_ops"] == 1  # 2、3 已在库，只新入 1
+    st = a.get("/status").json()
+    assert st["inbound_gaps"] == {}
+    assert st["version_vv"] == {"bravo": 3}
+    assert a.get("/status").json()["op_count"] == 3
+    # 整批重放全部幂等
+    replay = a.post("/sync/batch", json={"ops": list(ops.values())}).json()
+    assert replay["applied_ops"] == 0 and replay["duplicate_ops"] == 3
+
+
+def test_watermark_pull_does_not_resend_received(stations):
+    """按收件水位拉取：已连续收齐的不再发送，缺口件在补齐前持续可补拉。"""
+    a, b = stations["alpha"], stations["bravo"]
+    b.post("/records/R001/corrections", json={"count": 70})  # bravo-1
+    b.post("/records/R002/corrections", json={"count": 80})  # bravo-2
+
+    # alpha 水位为 0：两件都应返回
+    first = b.get(
+        "/sync/pull", params={"watermarks": '{"bravo": {"op": 0}}'}
+    ).json()
+    assert {o["id"] for o in first["ops"]} == {"bravo-1", "bravo-2"}
+
+    # 仅收到 bravo-2（缺口），水位仍为 0：补齐前 bravo-1 必须仍可拉取
+    a.post("/sync/batch", json={"ops": [o for o in first["ops"] if o["id"] == "bravo-2"]})
+    wm = a.get("/status").json()["inbound_watermarks"]
+    second = b.get("/sync/pull", params={"watermarks": json.dumps(wm)}).json()
+    assert {o["id"] for o in second["ops"]} == {"bravo-1", "bravo-2"}
+
+    # 补齐后水位到 3：再拉为空，不重复传已收更正
+    a.post("/sync/batch", json={"ops": [o for o in first["ops"] if o["id"] == "bravo-1"]})
+    wm = a.get("/status").json()["inbound_watermarks"]
+    third = b.get("/sync/pull", params={"watermarks": json.dumps(wm)}).json()
+    assert third["ops"] == [] and third["resolutions"] == []
+
+
+def test_gap_with_resolution_watermark_tracks_independently(stations):
+    """裁定序号与操作序号分别记水位；缺件的裁定补齐前不推进 :r 分量。"""
+    a, b = stations["alpha"], stations["bravo"]
+    a.post("/records/R001/corrections", json={"count": 50})
+    b.post("/records/R001/corrections", json={"count": 70})
+    a.post("/sync/run")
+    res = a.post(
+        "/conflicts/R001/resolve", json={"choice": "count", "count": 70}
+    ).json()
+    assert res["resolution_id"] == "alpha-r1"
+    st = a.get("/status").json()
+    # 本站裁定水位独立登记：水位是“下一应收序号”，收到 r1 后为 2；时钟分量为 1
+    assert st["inbound_watermarks"]["alpha"]["resolve"] == 2
+    assert st["version_vv"]["alpha:r"] == 1
+
+    # bravo 全量拉取包含该裁定，应用后裁定水位与操作水位分别就位
+    batch = a.get("/sync/pull").json()
+    r = b.post("/sync/batch", json=batch)
+    assert r.status_code == 200
+    bst = b.get("/status").json()
+    assert bst["inbound_watermarks"]["alpha"]["resolve"] == 2
+    assert bst["inbound_watermarks"]["alpha"]["op"] >= 1
+    assert bst["version_vv"]["alpha:r"] == 1
+
+
+def test_legacy_volume_backfills_watermarks_and_holds_clock_on_gap(stations):
+    """旧版本数据卷（无收件表）升级：回填水位/缺口，缺件不被旧时钟跳过。"""
+    import sqlite3
+
+    legacy = os.path.join(stations["tmp"], "legacy-alpha.db")
+    conn = sqlite3.connect(legacy)
+    conn.executescript(
+        """
+        CREATE TABLE meta (id INTEGER PRIMARY KEY CHECK(id=1), station_id TEXT,
+            vv TEXT, seq INTEGER, res_seq INTEGER);
+        CREATE TABLE records (record_id TEXT PRIMARY KEY, site TEXT, species TEXT,
+            seed_count INTEGER, count INTEGER, deleted INTEGER DEFAULT 0,
+            version_vv TEXT, conflicted INTEGER DEFAULT 0, has_resolution INTEGER DEFAULT 0);
+        CREATE TABLE ops (id TEXT PRIMARY KEY, record_id TEXT, station_id TEXT,
+            seq INTEGER, type TEXT, count INTEGER, vv TEXT, created_at TEXT);
+        CREATE TABLE resolutions (id TEXT PRIMARY KEY, record_id TEXT, station_id TEXT,
+            choice TEXT, count INTEGER, vv TEXT, read_max_vv TEXT, created_at TEXT);
+        """
+    )
+    # 旧库时钟被错误地并到 bravo:2，但 bravo-1 实际缺件
+    conn.execute("INSERT INTO meta VALUES (1,'alpha','{\"bravo\":2}',1,0)")
+    conn.execute(
+        "INSERT INTO records VALUES ('R001','北岸滩涂','黑腹滨鹬',32,32,0,NULL,0,0)"
+    )
+    conn.execute(
+        "INSERT INTO ops VALUES ('bravo-2','R001','bravo',2,'count',80,"
+        "'{\"bravo\":2}','2026-01-01T00:00:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO ops VALUES ('alpha-1','R001','alpha',1,'count',11,"
+        "'{\"alpha\":1}','2026-01-01T00:00:01+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    upgraded = create_app("alpha", legacy, CSV_PATH, peer_url="http://bravo.local")
+    with TestClient(upgraded) as uc:
+        st = uc.get("/status").json()
+        # bravo 连续水位停在 1（缺 bravo-1），已到的 2 进缺口；alpha 连续到 2
+        assert st["inbound_watermarks"] == {
+            "bravo": {"op": 1},
+            "alpha": {"op": 2},
+        }
+        assert st["inbound_gaps"] == {"bravo": {"op": [2]}}
+        # 重建后的时钟不再虚高：没有 bravo 分量
+        assert st["version_vv"] == {"alpha": 1}
+    # 重新打开同一卷，水位保持（重启幂等）
+    again = create_app("alpha", legacy, CSV_PATH, peer_url="http://bravo.local")
+    with TestClient(again) as ac2:
+        st2 = ac2.get("/status").json()
+        assert st2["inbound_gaps"] == {"bravo": {"op": [2]}}
+        assert st2["version_vv"] == {"alpha": 1}

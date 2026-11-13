@@ -16,6 +16,10 @@ docker compose up -d --build
 
 # 脚本演示：离线更正 → 同步 → 冲突 → 裁定 → 再同步 → 分析取数
 bash scripts/demo.sh
+
+# 缺件同步演示：先收第 2 条缺第 1 条 → 缺件期间本地更正 → 重启补齐 → 冲突排除
+bash scripts/demo_gap.sh                 # curl 版（配合 docker compose）
+python3 scripts/demo_gap_restart.py      # 进程级演示，含重启，无需 Docker
 ```
 
 停止与清理（数据保留在命名卷中；`-v` 连数据卷一起删除）：
@@ -34,7 +38,9 @@ docker compose down -v     # 清空数据卷，下次启动重新以 CSV 初始�
 | `records` | 当前对账结果：计数、删除标记、冲突标记、生效分支向量时钟 |
 | `ops` | **只追加**的更正/删除日志，每条带站点向量时钟（version vector） |
 | `resolutions` | 只追加的裁定日志，含裁定时读到的极大分支快照 `read_max_vv` |
-| `meta` | 本站 ID、本地操作序号、裁定序号、当前向量时钟 |
+| `meta` | 本站 ID、本地操作序号、裁定序号、当前向量时钟（由收件水位重建） |
+| `inbound_progress` | 按「来源站点 × 日志类型（操作/裁定）」记录**连续收件水位**（下一应收序号） |
+| `inbound_gaps` | 乱序先到、落在连续水位之外的已收序列号（缺件窗口），重启保留 |
 
 种子文件 `data/seed/sample_counts.csv`（两站同一份），列：
 `record_id,site,species,count`，其中 `count` 必须是非负整数；只允许改计数或删除。
@@ -69,13 +75,39 @@ docker compose down -v     # 清空数据卷，下次启动重新以 CSV 初始�
 
 ### 2.5 同步语义（可重复、乱序、中断重试）
 
-* `GET /sync/pull?since=<向量时钟JSON>`：返回严格处于 `since` 因果未来的操作与裁定；
+* `GET /sync/pull?since=<向量时钟JSON>`：返回严格处于 `since` 因果未来的操作与裁定（兼容旧客户端）；
+* `GET /sync/pull?watermarks=<收件水位JSON>`：**推荐**，按调用方连续收件水位精确返回
+  其尚缺的日志（含缺件窗口），已连续收齐的不重复发送；
 * `POST /sync/batch`：整批在一个 `BEGIN IMMEDIATE` 事务内写入，
-  任一载荷非法或与同 ID 历史载荷不一致 → **整批回滚**；
+  任一载荷非法或与同 ID 历史载荷不一致 → **整批回滚**（不写数据、不推进收件进度）；
 * 按操作/裁定全局 ID **幂等去重**，重复、乱序、分批投递结果完全一致；
-* `POST /sync/run`：一键多轮拉/推直到两站向量时钟相等，可安全重复调用；
+* `POST /sync/run`：以双方收件水位多轮拉/推直到时钟相等且两侧均无缺口，可安全重复调用；
   对站不可达返回 503，本地数据不受影响；
 * 收齐相同更正、删除与裁定日志的两站，重算得到**相同的记录状态与冲突集合**。
+
+### 2.6 缺件（缺口）同步：消息时钟不能代表已收齐明细
+
+网络分批/丢消息时，接收方可能先到某站的第 2 条修改、第 1 条（涉及另一记录）却尚未收到。
+消息载荷里携带的向量时钟只代表“消息产生时”的知识，**不能**用来把本站时钟直接跳到该分量，
+否则缺件会被永久跳过、分析继续提供旧计数或已删记录，而一键同步却误报成功。
+
+本服务用持久化的**连续收件水位 + 缺口表**解决：
+
+* 每个来源站点的操作、裁定分别维护一条连续水位 `next_seq`（1..next_seq-1 已连续收齐）；
+* 收到 `seq == next_seq`（水位从 0 起，首件即此情形）→ 水位连续前进，并吞并缺口表中
+  后续已到的序列号；收到 `seq > next_seq + 1` → 中间存在缺件，本条只入缺口表，
+  **水位与向量时钟都不推进**；
+* 本站向量时钟的远端分量只从连续水位重建，缺件补齐前不会虚高；缺件补齐（含**重启后**）
+  时水位连续前进，缺件对应的更正/删除才进入因果对账；
+* 缺件窗口内**允许本地更正/删除**；后来补到的、操作者未读的不同计数或删除，按原有
+  极大分支规则判为**并发冲突**，从分析取数排除，不会被缺件期间的新更正静默覆盖；
+* 重复或乱序投递按全局 ID 与缺口表双重幂等，绝不重复入库；批次失败整批回滚，
+  不留下任何修改也不推进收件进度；
+* 补齐后按收件水位再同步，已收的更正/删除不会重复传输；
+* 旧版本数据卷（无收件表）启动时自动从已落库日志回填水位与缺口并重建时钟，升级无缝。
+
+`GET /status` 额外返回 `inbound_watermarks`（各来源下一应收序号）与
+`inbound_gaps`（仍缺的乱序序列号），可直接观察缺件状态。
 
 ## 3. HTTP 接口一览
 
@@ -87,10 +119,10 @@ docker compose down -v     # 清空数据卷，下次启动重新以 CSV 初始�
 | `GET /conflicts` | 全部冲突及分支、裁定生效/陈旧状态 |
 | `POST /conflicts/{id}/resolve` | 裁定：`{"choice":"count","count":N}` 或 `{"choice":"delete"}` |
 | `GET /analysis/counts` | **种群分析取数**：仅无冲突且未删除的计数 |
-| `GET /sync/pull?since=...` | 增量拉取操作与裁定 |
-| `POST /sync/batch` | 推送批次（原子、幂等） |
-| `POST /sync/run` | 一键双向同步 |
-| `GET /status` / `GET /healthz` | 向量时钟与计数 / 健康检查 |
+| `GET /sync/pull?since=...` 或 `?watermarks=...` | 增量拉取：向量时钟因果过滤（兼容）或收件水位精确补拉（推荐，支持缺件补齐） |
+| `POST /sync/batch` | 推送批次（原子、幂等；失败不推进收件进度） |
+| `POST /sync/run` | 一键双向同步（水位驱动，直到时钟相等且无缺口） |
+| `GET /status` / `GET /healthz` | 向量时钟、收件水位/缺口与计数 / 健康检查 |
 
 ## 4. 典型手工流程（curl）
 
@@ -119,13 +151,15 @@ curl -s $B/records/R001
 ```bash
 python3 -m venv --without-pip .venv          # 无 pip 的环境可先 bootstrap
 .venv/bin/python -m pip install -r requirements.txt httpx pytest
-.venv/bin/python -m pytest tests/ -q         # 28 个端到端用例（进程内双站/三站）
+.venv/bin/python -m pytest tests/ -q         # 38 个端到端用例（进程内双站/三站）
 ```
 
 测试覆盖：种子一致性、并发计数/删除冲突、同值与双删自动合并、因果链无冲突、
 裁定计数/删除、陈旧裁定拒绝、未见并发更正重开冲突、后继更正静默覆盖、
 乐观锁、批次原子回滚、幂等/乱序/中断重试收敛、重启持久化、卷站点身份保护、
-双站并发裁定确定性收敛。
+双站并发裁定确定性收敛，以及**缺件同步**：缺件时钟不虚高、缺口持久化与重启补齐、
+缺件期间本地更正后补件冲突且分析排除、缺件删除不被覆盖、失败批次不推进进度、
+乱序重复不重复入库、水位拉取不重传、操作/裁定水位独立、旧数据卷升级回填。
 
 ## 6. 目录结构
 
@@ -138,6 +172,8 @@ bird-sync/
 │   └── schemas.py     # 请求/响应模型（Swagger 示例）
 ├── data/seed/sample_counts.csv
 ├── scripts/demo.sh
+├── scripts/demo_gap.sh            # 缺件同步 curl 演示（配合 docker compose）
+├── scripts/demo_gap_restart.py    # 缺件→重启→补齐 进程级演示（无需 Docker）
 ├── tests/test_sync.py
 ├── Dockerfile
 ├── docker-compose.yml

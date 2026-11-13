@@ -238,15 +238,40 @@ def create_app(
         "/sync/pull",
         response_model=BatchBody,
         tags=["sync"],
-        summary="拉取：返回向量时钟 since 因果未来的全部操作与裁定",
+        summary="拉取：按向量时钟或收件水位返回对站尚缺的操作与裁定",
     )
     def sync_pull(
         since: str | None = Query(
             default=None,
-            description='调用方向量时钟的 JSON 字符串，如 {"alpha":2}；缺省表示全量',
+            description='调用方向量时钟 JSON，如 {"alpha":2}；缺省且未给 watermarks 时全量',
+        ),
+        watermarks: str | None = Query(
+            default=None,
+            description=(
+                "调用方收件水位 JSON（推荐，支持缺件补齐）："
+                '{"bravo":{"op":3,"resolve":1}}，值为各来源下一应收序号；'
+                "服务端只返回序列号不低于水位的日志，已收齐的不重复发送"
+            ),
         ),
         conn: sqlite3.Connection = Depends(get_conn),
     ):
+        if watermarks:
+            try:
+                wm = json.loads(watermarks)
+                if not isinstance(wm, dict):
+                    raise ValueError
+                for per_station in wm.values():
+                    if not isinstance(per_station, dict) or not all(
+                        k in ("op", "resolve") and isinstance(v, int) and v >= 0
+                        for k, v in per_station.items()
+                    ):
+                        raise ValueError
+            except (json.JSONDecodeError, ValueError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="watermarks 必须为 {站点: {op|resolve: 非负整数}} 的 JSON",
+                )
+            return db.pull_for_peer(conn, wm)
         if since:
             try:
                 since_vv = json.loads(since)
@@ -308,15 +333,17 @@ def create_app(
             ) as client:
                 for rounds in range(1, MAX_SYNC_ROUNDS + 1):
                     before_vv = db.status(conn)["version_vv"]
+                    before_wm = db.status(conn)["inbound_watermarks"]
 
-                    # 1) 拉：把对站因果未来的日志取回并整批应用
+                    # 1) 拉：以本站“收件水位”向对站索取尚缺日志（含缺件窗口）。
+                    #    消息携带的向量时钟不代表已收齐明细，因此不能只按时钟过滤。
                     peer_status = (
                         await client.get("/status")
                     ).raise_for_status().json()
                     incoming = (
                         await client.get(
                             "/sync/pull",
-                            params={"since": json.dumps(before_vv)},
+                            params={"watermarks": json.dumps(before_wm)},
                         )
                     ).raise_for_status().json()
                     if incoming["ops"] or incoming["resolutions"]:
@@ -328,9 +355,12 @@ def create_app(
                             "applied_resolutions"
                         ]
 
-                    # 2) 推：把本站相对对站时钟因果未来的日志发给对站
-                    local_vv = db.status(conn)["version_vv"]
-                    outgoing = db.pull_since(conn, peer_status["version_vv"])
+                    # 2) 推：把对站收件水位之后的日志发给对站；对站按全局 ID 幂等，
+                    #    已收齐的更正/删除不会被重复入库。
+                    local_status = db.status(conn)
+                    outgoing = db.pull_for_peer(
+                        conn, peer_status["inbound_watermarks"]
+                    )
                     if outgoing["ops"] or outgoing["resolutions"]:
                         resp = await client.post("/sync/batch", json=outgoing)
                         resp.raise_for_status()
@@ -339,15 +369,26 @@ def create_app(
                             outgoing["resolutions"]
                         )
 
-                    after_vv = db.status(conn)["version_vv"]
+                    after_status = db.status(conn)
+                    after_vv = after_status["version_vv"]
                     nothing_moved = not (
                         incoming["ops"]
                         or incoming["resolutions"]
                         or outgoing["ops"]
                         or outgoing["resolutions"]
                     )
+                    # 收敛要求：两侧时钟相等、本轮无日志流动，且本站与对站都没有
+                    # 未补齐的缺口。只要还缺件（时钟被水位按住），就继续重试拉取。
+                    local_gap_free = all(
+                        not g for g in (after_status["inbound_gaps"] or {}).values()
+                    )
+                    peer_gap_free = all(
+                        not g for g in (peer_status.get("inbound_gaps") or {}).values()
+                    )
                     if (
                         nothing_moved
+                        and local_gap_free
+                        and peer_gap_free
                         and vv_equal(before_vv, after_vv)
                         and vv_equal(after_vv, peer_status["version_vv"])
                     ):

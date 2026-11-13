@@ -124,6 +124,17 @@ class StatusOut(BaseModel):
     resolution_count: int
     record_count: int
     conflict_count: int
+    inbound_watermarks: dict[str, dict[str, int]] = Field(
+        default_factory=dict,
+        description=(
+            "按来源站点记录的连续收件水位（下一应收序号）："
+            '{"bravo": {"op": 3, "resolve": 1}} 表示 bravo 的操作已连续收至 2、裁定收至 0'
+        ),
+    )
+    inbound_gaps: dict[str, dict[str, list[int]]] = Field(
+        default_factory=dict,
+        description="乱序先到、尚不能并入连续水位的已收序列号（缺件窗口）",
+    )
 
 
 class SyncResult(BaseModel):

@@ -7,6 +7,20 @@
 * 记录当前状态由 ``_reconcile`` 从操作日志+裁定重算，因此同步可重复、乱序、中断重试，
   收齐相同日志的两站必然得到相同记录与冲突；
 * 批次在单个 ``BEGIN IMMEDIATE`` 事务内写入，任何失败整批回滚。
+
+缺件（缺口）同步
+----------------
+消息载荷里携带的向量时钟只代表“消息产生时”的知识，**不能**证明接收站已按序号
+收齐某站的全部明细：先到第 2 条、第 1 条缺件时，时钟分量绝不能直接跳到 2。
+因此另维护两张持久化表：
+
+* ``inbound_progress``：按「来源站点 × 日志类型（操作/裁定）」记录**连续收件水位**
+  （``next_seq``，即 1..next_seq-1 已连续收齐）；
+* ``inbound_gaps``：乱序先到、落在水位之外的已收序列号。
+
+本站向量时钟的远端分量只由连续水位重建，缺件补齐前不推进；补齐（含重启后）时
+水位连续前进，缺件对应的更正/删除才进入因果对账。重复/乱序投递按全局 ID 与
+缺口表双重幂等，绝不重复入库。
 """
 
 from __future__ import annotations
@@ -20,7 +34,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from .vv import Vv, copy_vv, merge_many, vv_equal, vv_lt
+from .vv import Vv, copy_vv, vv_equal, vv_lt
 
 # FastAPI 同步端点跑在线程池中，所有写事务经此锁串行化，
 # 避免同一连接上并发 BEGIN IMMEDIATE 互相破坏事务状态。
@@ -76,6 +90,23 @@ CREATE TABLE IF NOT EXISTS resolutions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_res_record ON resolutions(record_id);
+-- 连续收件水位：next_seq 之前（1..next_seq-1）的该来源日志已连续收齐。
+-- kind='op'      -> 对应向量时钟分量 "<station>"
+-- kind='resolve' -> 对应裁定专用分量 "<station>:r"
+CREATE TABLE IF NOT EXISTS inbound_progress (
+    station_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('op', 'resolve')),
+    next_seq INTEGER NOT NULL,
+    PRIMARY KEY (station_id, kind)
+);
+-- 乱序先到、尚不能并入连续水位的已收序列号（缺件窗口）。
+CREATE TABLE IF NOT EXISTS inbound_gaps (
+    station_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('op', 'resolve')),
+    seq INTEGER NOT NULL,
+    PRIMARY KEY (station_id, kind, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_gaps_lookup ON inbound_gaps(station_id, kind, seq);
 """
 
 
@@ -121,6 +152,9 @@ def init_db(conn: sqlite3.Connection, station_id: str, csv_path: str) -> None:
             raise RuntimeError(
                 f"数据卷属于站点 {row['station_id']}，不能以 {station_id} 身份启动"
             )
+        # 旧版本数据卷：从已持久化的日志回填收件水位，并据水位重建向量时钟，
+        # 使升级后的进程在重启后继续以“连续收件”语义同步（缺件不再被时钟掩盖）。
+        _backfill_inbound_state(conn)
         return
 
     rows: list[tuple[str, str, str, int]] = []
@@ -186,6 +220,142 @@ def _tick(conn: sqlite3.Connection) -> tuple[str, int, Vv]:
         "UPDATE meta SET vv = ?, seq = ? WHERE id = 1", (_dump(vv), seq)
     )
     return meta["station_id"], seq, vv
+
+
+# ----------------------------------------------------------------- 收件水位与缺口
+
+
+def _get_watermark(conn: sqlite3.Connection, station_id: str, kind: str) -> int:
+    """某来源站点某类日志的连续收件水位（已连续收至 next_seq-1）。"""
+    row = conn.execute(
+        "SELECT next_seq FROM inbound_progress WHERE station_id = ? AND kind = ?",
+        (station_id, kind),
+    ).fetchone()
+    return int(row["next_seq"]) if row is not None else 0
+
+
+def _set_watermark(
+    conn: sqlite3.Connection, station_id: str, kind: str, next_seq: int
+) -> None:
+    conn.execute(
+        "INSERT INTO inbound_progress (station_id, kind, next_seq) VALUES (?, ?, ?) "
+        "ON CONFLICT(station_id, kind) DO UPDATE SET next_seq = excluded.next_seq",
+        (station_id, kind, next_seq),
+    )
+
+
+def _mark_received(
+    conn: sqlite3.Connection, station_id: str, kind: str, seq: int
+) -> bool:
+    """登记一条来源日志的序列号；返回 False 表示该序列号此前已收（重复投递）。
+
+    水位 ``wm`` 是“下一应收序号”（1..wm-1 已连续收齐）：
+
+    * ``seq < wm`` 或已在缺口表中：重复，返回 False；
+    * ``seq == wm``（wm 从 0 起，首件 seq=1 即此情形）：连续前进，
+      并顺手吞并缺口表中后续已到的序列号；
+    * ``seq > wm``：wm..seq-1 仍是缺件，本条先记入缺口表，水位与时钟均不动。
+    """
+    wm = _get_watermark(conn, station_id, kind)
+    if seq < wm:
+        return False
+    gap = conn.execute(
+        "SELECT 1 FROM inbound_gaps WHERE station_id = ? AND kind = ? AND seq = ?",
+        (station_id, kind, seq),
+    ).fetchone()
+    if gap is not None:
+        return False
+    if seq > wm + 1:
+        # 乱序先到：wm..seq-1 中存在缺件（wm 本身尚未收到），本条暂存缺口，水位不动
+        conn.execute(
+            "INSERT INTO inbound_gaps (station_id, kind, seq) VALUES (?, ?, ?)",
+            (station_id, kind, seq),
+        )
+        return True
+    # seq == wm（wm=0 时即首件 seq=1）：补齐了水位上的下一件，
+    # 连续推进并消化缺口表中后续已到的序列号
+    conn.execute(
+        "DELETE FROM inbound_gaps WHERE station_id = ? AND kind = ? AND seq = ?",
+        (station_id, kind, seq),
+    )
+    nxt = seq + 1
+    while True:
+        row = conn.execute(
+            "SELECT seq FROM inbound_gaps WHERE station_id = ? AND kind = ? AND seq = ?",
+            (station_id, kind, nxt),
+        ).fetchone()
+        if row is None:
+            break
+        conn.execute(
+            "DELETE FROM inbound_gaps WHERE station_id = ? AND kind = ? AND seq = ?",
+            (station_id, kind, nxt),
+        )
+        nxt += 1
+    _set_watermark(conn, station_id, kind, nxt)
+    return True
+
+
+def _rebuild_clock(conn: sqlite3.Connection) -> Vv:
+    """从连续收件水位重建本站向量时钟。
+
+    操作水位写入来源站点分量，裁定水位写入 ``"<station>:r"`` 专用分量；
+    本站自身的水位即本地序号。缺口表中的乱序件不参与，因此缺件期间时钟
+    不会虚高，缺件对应的更正/删除补齐后才进入因果对账。
+    """
+    clock: Vv = {}
+    for row in conn.execute(
+        "SELECT station_id, kind, next_seq FROM inbound_progress"
+    ).fetchall():
+        key = row["station_id"] if row["kind"] == "op" else f"{row['station_id']}:r"
+        if row["next_seq"] > 0:
+            clock[key] = int(row["next_seq"]) - 1
+    conn.execute("UPDATE meta SET vv = ? WHERE id = 1", (_dump(clock),))
+    return clock
+
+
+def _inbound_watermarks(conn: sqlite3.Connection) -> dict[str, dict[str, int]]:
+    """对外暴露的收件进度：{站点: {"op": 下一应收序号, "resolve": ...}}。"""
+    out: dict[str, dict[str, int]] = {}
+    for row in conn.execute(
+        "SELECT station_id, kind, next_seq FROM inbound_progress"
+    ).fetchall():
+        out.setdefault(row["station_id"], {})[row["kind"]] = int(row["next_seq"])
+    return out
+
+
+def _backfill_inbound_state(conn: sqlite3.Connection) -> None:
+    """旧数据卷升级：从已落库的操作/裁定日志回填连续水位与缺口，再重建时钟。
+
+    仅当收件进度表为空时执行（新版本重启时为空操作，保持幂等）。
+    """
+    if conn.execute("SELECT 1 FROM inbound_progress LIMIT 1").fetchone() is not None:
+        return
+    op_seqs: dict[str, set[int]] = {}
+    for row in conn.execute("SELECT station_id, seq FROM ops").fetchall():
+        op_seqs.setdefault(row["station_id"], set()).add(int(row["seq"]))
+    res_seqs: dict[str, set[int]] = {}
+    for row in conn.execute("SELECT id, station_id FROM resolutions").fetchall():
+        m = re.fullmatch(r"(.+)-r(\d+)", row["id"])
+        if m:
+            res_seqs.setdefault(row["station_id"], set()).add(int(m.group(2)))
+    for station, seqs in op_seqs.items():
+        _backfill_one(conn, station, "op", seqs)
+    for station, seqs in res_seqs.items():
+        _backfill_one(conn, station, "resolve", seqs)
+    _rebuild_clock(conn)
+
+
+def _backfill_one(
+    conn: sqlite3.Connection, station_id: str, kind: str, seqs: set[int]
+) -> None:
+    wm = 0
+    while (wm + 1) in seqs:
+        wm += 1
+    _set_watermark(conn, station_id, kind, wm + 1)
+    conn.executemany(
+        "INSERT OR IGNORE INTO inbound_gaps (station_id, kind, seq) VALUES (?, ?, ?)",
+        [(station_id, kind, s) for s in sorted(seqs) if s > wm],
+    )
 
 
 # --------------------------------------------------------------------------- 对账
@@ -362,6 +532,8 @@ def _insert_op(
             utc_now_iso(),
         ),
     )
+    # 本地产生的操作同样登记连续收件水位：本站操作天然连续，水位随序号前进
+    _mark_received(conn, station_id, "op", seq)
     return {"id": op_id, "vv": vv}
 
 
@@ -449,13 +621,14 @@ def resolve(
         res_seq = meta["res_seq"] + 1
         res_id = f"{meta['station_id']}-r{res_seq}"
         read_max_vv = [_load(m["vv"]) for m in maximals]
-        # 裁定推进专用时钟分量 "<station>:r"，使裁定可被同步过滤器识别为新知识
-        res_vv = copy_vv(meta["vv"])
-        res_vv[f"{meta['station_id']}:r"] = res_seq
+        # 裁定推进专用时钟分量 "<station>:r"，使裁定可被同步过滤器识别为新知识。
+        # 时钟分量改由连续收件水位统一重建（含本站裁定），避免与缺件语义脱节。
         conn.execute(
-            "UPDATE meta SET res_seq = ?, vv = ? WHERE id = 1",
-            (res_seq, _dump(res_vv)),
+            "UPDATE meta SET res_seq = ? WHERE id = 1",
+            (res_seq,),
         )
+        _mark_received(conn, meta["station_id"], "resolve", res_seq)
+        res_vv = _rebuild_clock(conn)
         # 本站旧裁定被新裁定取代
         conn.execute(
             "DELETE FROM resolutions WHERE record_id = ? AND station_id = ?",
@@ -589,6 +762,9 @@ def apply_batch(
                     )
                 dup_ops += 1
                 continue
+            # 按来源站点序列号登记收件进度：缺件（前置序号未到）只入缺口表，
+            # 连续水位与向量时钟均不推进，保证缺件不被消息携带的时钟“跳过”。
+            _mark_received(conn, data["station_id"], "op", data["seq"])
             conn.execute(
                 "INSERT INTO ops (id, record_id, station_id, seq, type, count, vv, "
                 "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -659,6 +835,13 @@ def apply_batch(
                 dup_res += 1
                 continue
 
+            # 裁定同样按来源站点的裁定序号登记连续收件水位（即便因确定性
+            # 择优落选，它代表“已收到的知识”，收件进度仍须前进）。
+            res_seq = int(re.fullmatch(
+                rf"{re.escape(res_sid)}-r(\d+)", res_id
+            ).group(1))
+            _mark_received(conn, res_sid, "resolve", res_seq)
+
             winner = conn.execute(
                 "SELECT * FROM resolutions WHERE record_id = ? ORDER BY id LIMIT 1",
                 (data["record_id"],),
@@ -691,18 +874,11 @@ def apply_batch(
         for rid in affected:
             _reconcile(conn, rid)
 
-        # 把入站日志携带的向量时钟并入本站时钟（只合并不递增本站序号），
-        # 使两站在收齐相同日志后拥有完全相同的向量时钟，同步得以收敛。
-        # 注意：即使裁定因确定性排序落选，其向量时钟仍代表“已收到的知识”，必须并入。
-        incoming_vvs = [d["vv"] for d in ops_in] + [
-            d["vv"] for d in resolutions_in
-        ]
-        if incoming_vvs:
-            meta_row = conn.execute("SELECT vv FROM meta WHERE id = 1").fetchone()
-            merged = merge_many([_load(meta_row["vv"])] + incoming_vvs)
-            conn.execute(
-                "UPDATE meta SET vv = ? WHERE id = 1", (_dump(merged),)
-            )
+        # 向量时钟只从“连续收件水位”重建：缺件（缺口表中的乱序件）不推进任何
+        # 分量，消息载荷携带的时钟因此不能再代表本站已收齐明细。两站收齐相同
+        # 日志后水位一致，重建出的时钟也完全相同，同步得以收敛。
+        if ops_in or resolutions_in:
+            _rebuild_clock(conn)
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
@@ -738,6 +914,44 @@ def pull_since(
     ).fetchall():
         vv = _load(row["vv"])
         if not vv_le(vv, since):
+            res_out.append(_res_dict(row))
+    return {"ops": ops_out, "resolutions": res_out}
+
+
+def pull_for_peer(
+    conn: sqlite3.Connection,
+    peer_watermarks: Optional[dict[str, dict[str, int]]],
+) -> dict[str, list[dict[str, Any]]]:
+    """按对站「收件水位 + 缺口」精确返回其尚缺的操作与裁定。
+
+    ``peer_watermarks`` 形如 ``{"alpha": {"op": 3, "resolve": 1}, ...}``，
+    其中值为对站记录的**下一应收序号**。对每个来源站点：
+
+    * 序列号 >= 该来源的水位（即尚未连续收齐）一律返回，含缺口表中的乱序件，
+      因此缺件补齐前每次都会重发缺的那件，补齐后不再重复；
+    * 已连续收齐（seq < 水位）的不重复发送。
+
+    缺省（旧客户端不带水位）时退化为全量，由对站按全局 ID 幂等去重。
+    """
+    wm_map = peer_watermarks or {}
+
+    def _next_seq(station_id: str, kind: str) -> int:
+        return int(wm_map.get(station_id, {}).get(kind, 0))
+
+    ops_out: list[dict[str, Any]] = []
+    for row in conn.execute("SELECT * FROM ops ORDER BY id").fetchall():
+        if row["seq"] >= _next_seq(row["station_id"], "op"):
+            ops_out.append(_op_dict(row))
+    res_out: list[dict[str, Any]] = []
+    for row in conn.execute(
+        "SELECT * FROM resolutions ORDER BY id"
+    ).fetchall():
+        m = re.fullmatch(r"(.+)-r(\d+)", row["id"])
+        if m is None:
+            # 非标准 id 的裁定无法定位水位，保守全量发送（对站按 ID 幂等）
+            res_out.append(_res_dict(row))
+            continue
+        if int(m.group(2)) >= _next_seq(m.group(1), "resolve"):
             res_out.append(_res_dict(row))
     return {"ops": ops_out, "resolutions": res_out}
 
@@ -847,6 +1061,13 @@ def analysis_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 
 def status(conn: sqlite3.Connection) -> dict[str, Any]:
     meta = get_meta(conn)
+    gaps: dict[str, dict[str, list[int]]] = {}
+    for row in conn.execute(
+        "SELECT station_id, kind, seq FROM inbound_gaps ORDER BY station_id, kind, seq"
+    ).fetchall():
+        gaps.setdefault(row["station_id"], {}).setdefault(row["kind"], []).append(
+            int(row["seq"])
+        )
     return {
         "station_id": meta["station_id"],
         "version_vv": meta["vv"],
@@ -860,4 +1081,7 @@ def status(conn: sqlite3.Connection) -> dict[str, Any]:
         "conflict_count": conn.execute(
             "SELECT COUNT(*) c FROM records WHERE conflicted = 1"
         ).fetchone()["c"],
+        # 各来源站点的连续收件水位（下一应收序号）与仍缺的乱序序列号
+        "inbound_watermarks": _inbound_watermarks(conn),
+        "inbound_gaps": gaps,
     }
